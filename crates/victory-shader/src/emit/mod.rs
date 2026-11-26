@@ -2579,4 +2579,165 @@ mod accc_tests {
             v.validate(&mut host.dxil.clone()).unwrap();
         }
     }
+
+    #[test]
+    fn translates_accc_fspx_scc_some_into_s_cselect_b64() {
+        let code_words: Vec<u32> = vec![
+            0x7D0A_0081, // v_cmp_ne_i32 vcc, 1, v0
+            0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+            0x8592_80C1, // s_cselect_b64 s[18:19], -1, 0
+            0xBF03_8080, // s_cmp_ge_u32 0, 0
+            0x8594_80C1, // s_cselect_b64 s[20:21], -1, 0
+            0x8B92_1214, // s_orn2_b64 s[18:19], s[20:21], s[18:19]
+            0xBF84_0001, // s_cbranch_scc0 +1
+            0xBF80_0000, // s_nop 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut meta = vec![0u8; 28];
+        meta[0..4].copy_from_slice(&0x4005_cf00u32.to_le_bytes());
+        meta[4..8].copy_from_slice(&0x6c09_0102u32.to_le_bytes());
+        meta[12..14].copy_from_slice(&64u16.to_le_bytes());
+        meta[14..16].copy_from_slice(&1u16.to_le_bytes());
+        meta[16..18].copy_from_slice(&1u16.to_le_bytes());
+        meta[20..24].copy_from_slice(&0x402c_0349u32.to_le_bytes());
+        meta[24..28].copy_from_slice(&0x0000_0190u32.to_le_bytes());
+        let info = [0u8; 20];
+        let mut bindings = Vec::new();
+        bindings.extend_from_slice(&0x403u32.to_le_bytes());
+        bindings.extend_from_slice(&4u32.to_le_bytes());
+        bindings.extend_from_slice(&(code_words.len() as u32).to_le_bytes());
+        bindings.extend_from_slice(&0u64.to_le_bytes());
+        bindings.extend_from_slice(&0x440u32.to_le_bytes());
+        let sec0_off = 0x50u32;
+        let sec1_off = sec0_off + meta.len() as u32;
+        let sec6_off = (sec1_off + info.len() as u32).next_multiple_of(16);
+        let sec7_off = sec6_off + code.len() as u32;
+        let total = sec7_off + bindings.len() as u32;
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&4u32.to_le_bytes());
+        fspx.extend_from_slice(&total.to_le_bytes());
+        for (kind, off, sz) in [
+            (0u32, sec0_off, meta.len() as u32),
+            (1u32, sec1_off, info.len() as u32),
+            (6u32, sec6_off, code.len() as u32),
+            (7u32, sec7_off, bindings.len() as u32),
+        ] {
+            fspx.extend_from_slice(&kind.to_le_bytes());
+            fspx.extend_from_slice(&off.to_le_bytes());
+            fspx.extend_from_slice(&sz.to_le_bytes());
+            fspx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        fspx.resize(sec0_off as usize, 0);
+        fspx.extend_from_slice(&meta);
+        fspx.extend_from_slice(&info);
+        fspx.resize(sec6_off as usize, 0);
+        fspx.extend_from_slice(&code);
+        fspx.extend_from_slice(&bindings);
+
+        let dxbc = crate::dxbc::build(&[
+            (FourCC::SFI0, &[0; 8]),
+            (FourCC::ISG1, &[0; 8]),
+            (FourCC::OSG1, &[0; 8]),
+            (FourCC::ACCC, &fspx),
+        ]);
+        let host = translate(&dxbc).expect("Wave64 scc_some into s_cselect_b64 should translate");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn translates_accc_fspx_wave64_per_lane_section_readlane63() {
+        let code_words: Vec<u32> = vec![
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+            0xD501_003D, // v_cndmask_b32 v61, 0, v0, s[8:9]
+            0x0022_0080,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 quad_perm:[1,0,3,2]
+            0xFF04_B13D,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 quad_perm:[2,3,0,1]
+            0xFF04_4E3D,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 row_half_mirror
+            0xFF05_413D,
+            0x387A_7AFA, // v_or_b32 v61, v61, v61 row_mirror
+            0xFF05_403D,
+            0xD778_003E, // v_permlanex16_b32 v62, v61, 0, 0
+            0x0201_013D,
+            0x387A_7D3D, // v_or_b32 v61, v61, v62
+            0xD760_003C, // v_readlane_b32 s60, v61, 0
+            0x0001_013D,
+            0x387A_7A3C, // v_or_b32 v61, s60, v61
+            0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+            0xD760_003C, // v_readlane_b32 s60, v61, 63
+            0x0001_7F3D,
+            0xBF07_803C, // s_cmp_lg_u32 s60, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBF80_0000, // s_nop 0
+            0xBF81_0000, // s_endpgm
+        ];
+
+        let code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut meta = vec![0u8; 28];
+        meta[0..4].copy_from_slice(&0x4005_cf00u32.to_le_bytes());
+        meta[4..8].copy_from_slice(&0x6c09_0102u32.to_le_bytes());
+        meta[12..14].copy_from_slice(&64u16.to_le_bytes());
+        meta[14..16].copy_from_slice(&1u16.to_le_bytes());
+        meta[16..18].copy_from_slice(&1u16.to_le_bytes());
+        meta[20..24].copy_from_slice(&0x402c_0349u32.to_le_bytes());
+        meta[24..28].copy_from_slice(&0x0000_0190u32.to_le_bytes());
+        let info = [0u8; 20];
+        let mut bindings = Vec::new();
+        bindings.extend_from_slice(&0x403u32.to_le_bytes());
+        bindings.extend_from_slice(&4u32.to_le_bytes());
+        bindings.extend_from_slice(&(code_words.len() as u32).to_le_bytes());
+        bindings.extend_from_slice(&0u64.to_le_bytes());
+        bindings.extend_from_slice(&0x440u32.to_le_bytes());
+        let sec0_off = 0x50u32;
+        let sec1_off = sec0_off + meta.len() as u32;
+        let sec6_off = (sec1_off + info.len() as u32).next_multiple_of(16);
+        let sec7_off = sec6_off + code.len() as u32;
+        let total = sec7_off + bindings.len() as u32;
+        let mut fspx = Vec::new();
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&1u32.to_le_bytes());
+        fspx.extend_from_slice(&4u32.to_le_bytes());
+        fspx.extend_from_slice(&total.to_le_bytes());
+        for (kind, off, sz) in [
+            (0u32, sec0_off, meta.len() as u32),
+            (1u32, sec1_off, info.len() as u32),
+            (6u32, sec6_off, code.len() as u32),
+            (7u32, sec7_off, bindings.len() as u32),
+        ] {
+            fspx.extend_from_slice(&kind.to_le_bytes());
+            fspx.extend_from_slice(&off.to_le_bytes());
+            fspx.extend_from_slice(&sz.to_le_bytes());
+            fspx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        fspx.resize(sec0_off as usize, 0);
+        fspx.extend_from_slice(&meta);
+        fspx.extend_from_slice(&info);
+        fspx.resize(sec6_off as usize, 0);
+        fspx.extend_from_slice(&code);
+        fspx.extend_from_slice(&bindings);
+
+        let dxbc = crate::dxbc::build(&[
+            (FourCC::SFI0, &[0; 8]),
+            (FourCC::ISG1, &[0; 8]),
+            (FourCC::OSG1, &[0; 8]),
+            (FourCC::ACCC, &fspx),
+        ]);
+        let host = translate(&dxbc).expect("Wave64 per-lane section readlane63 should translate");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
 }
