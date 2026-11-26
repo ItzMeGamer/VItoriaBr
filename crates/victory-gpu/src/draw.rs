@@ -87,8 +87,16 @@ const LOADING_DRAIN_MS: u64 = 400;
 const LOADING_DRAIN_MAX_MS: u64 = 1500;
 /// Default byte budget (256 MiB) for a loading-screen texture pre-drain pass.
 const LOADING_DRAIN_BYTES: u64 = 256 << 20;
-/// Default byte budget (64 MiB) for a normal `early_textures` pass.
+/// Default byte budget (64 MiB) for a normal `early_textures` pass on low-draw frames.
 const EARLY_PASS_DEFAULT_BYTES: u64 = 64 << 20;
+/// Maximum byte budget (32 MiB) per frame for `heap_textures` during active
+/// 3D gameplay frames (`>= LOADING_DRAIN_MAX_DRAWS` draws) unless
+/// `VICTORY_TEXTURE_PASS_MB` is explicitly set.
+const ACTIVE_3D_PASS_BYTES: u64 = 32 << 20;
+/// Maximum time budget (40 ms) per frame for `heap_textures` during active
+/// 3D gameplay frames (`>= LOADING_DRAIN_MAX_DRAWS` draws) unless
+/// `VICTORY_TEXTURE_PASS_MB` is explicitly set.
+const ACTIVE_3D_PASS_MS: u64 = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EarlyPassConfig {
@@ -117,6 +125,16 @@ enum EarlyPassKind {
     Normal,
     LoadingDrain,
     Bake,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeapPassInput {
+    stage_bytes: u64,
+    stage_ms: u64,
+    pass_bytes_override: Option<u64>,
+    catchup: bool,
+    due_count: usize,
+    frame_draws: u64,
 }
 
 fn parse_mb_bytes(val: &str) -> Option<u64> {
@@ -188,11 +206,19 @@ fn compute_early_pass_budget(
             cfg.pass_bytes_override.unwrap_or(LOADING_DRAIN_BYTES),
         )
     } else if cfg.early_ms > 0 {
-        (
-            EarlyPassKind::Normal,
-            cfg.early_ms.min(LOADING_DRAIN_MAX_MS),
-            cfg.pass_bytes_override.unwrap_or(EARLY_PASS_DEFAULT_BYTES),
-        )
+        let active_3d =
+            input.prev_frame_draws >= LOADING_DRAIN_MAX_DRAWS && cfg.pass_bytes_override.is_none();
+        let ms = if active_3d {
+            cfg.early_ms.min(ACTIVE_3D_PASS_MS)
+        } else {
+            cfg.early_ms.min(LOADING_DRAIN_MAX_MS)
+        };
+        let bytes = cfg.pass_bytes_override.unwrap_or(if active_3d {
+            EARLY_PASS_DEFAULT_BYTES.min(ACTIVE_3D_PASS_BYTES)
+        } else {
+            EARLY_PASS_DEFAULT_BYTES
+        });
+        (EarlyPassKind::Normal, ms, bytes)
     } else {
         return None;
     };
@@ -203,6 +229,56 @@ fn compute_early_pass_budget(
         return None;
     }
     Some((kind, (ms, bytes)))
+}
+
+/// Computes the `(ms, bytes)` budget for `State::heap_textures` when no
+/// explicit `PASS_BUDGET` override is active.
+///
+/// During active 3D gameplay frames (`frame_draws >= LOADING_DRAIN_MAX_DRAWS`),
+/// caps the per-frame budget to `32 MiB` / `40 ms` by default (unless
+/// `VICTORY_TEXTURE_PASS_MB` is explicitly set) so 3D frames never stall
+/// for seconds on texture uploads.
+fn compute_heap_pass_budget(input: HeapPassInput) -> (u64, u64) {
+    let mut bytes = input.pass_bytes_override.unwrap_or(input.stage_bytes);
+    let mut ms = input.stage_ms;
+    if input.catchup && input.due_count >= 1024 {
+        if input.pass_bytes_override.is_none() {
+            bytes = bytes.saturating_mul(3);
+        }
+        ms = ms.saturating_mul(3);
+    }
+    if input.frame_draws >= LOADING_DRAIN_MAX_DRAWS && input.pass_bytes_override.is_none() {
+        bytes = bytes.min(ACTIVE_3D_PASS_BYTES);
+        ms = ms.min(ACTIVE_3D_PASS_MS);
+    }
+    (ms, bytes)
+}
+
+/// Tracks previous-frame and current-frame host draw counts for `frame`.
+fn note_frame_draws(frame: u64) -> (u64, u64) {
+    static TRACKED_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static FRAME_START_DRAWN: AtomicU64 = AtomicU64::new(0);
+    static PREV_FRAME_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+    let total_drawn = drawn();
+    let prev_frame = TRACKED_FRAME.load(Ordering::Relaxed);
+    if prev_frame != frame
+        && TRACKED_FRAME
+            .compare_exchange(prev_frame, frame, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let prev_start = FRAME_START_DRAWN.swap(total_drawn, Ordering::Relaxed);
+        let avg_draws = if prev_frame == u64::MAX {
+            0
+        } else {
+            let elapsed_frames = frame.saturating_sub(prev_frame).max(1);
+            total_drawn.saturating_sub(prev_start) / elapsed_frames
+        };
+        PREV_FRAME_DRAWS.store(avg_draws, Ordering::Relaxed);
+    }
+    let prev = PREV_FRAME_DRAWS.load(Ordering::Relaxed);
+    let current = total_drawn.saturating_sub(FRAME_START_DRAWN.load(Ordering::Relaxed));
+    (prev, current)
 }
 
 /// The pixel shaders of the title's decoration bake (the title:
@@ -1947,8 +2023,6 @@ impl State {
             && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         static BAKE_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static EARLY_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-        static LAST_DRAWN: AtomicU64 = AtomicU64::new(0);
-        static PREV_FRAME_DRAWS: AtomicU64 = AtomicU64::new(0);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
@@ -1971,23 +2045,11 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
-        let prev_frame = EARLY_FRAME.swap(frame, Ordering::Relaxed);
-        let first = prev_frame != frame;
+        let first = EARLY_FRAME.swap(frame, Ordering::Relaxed) != frame;
         if !first && !(bake && left > 0) {
             return;
         }
-        if first {
-            let total_drawn = drawn();
-            let prev_total = LAST_DRAWN.swap(total_drawn, Ordering::Relaxed);
-            let avg_draws = if prev_frame == u64::MAX {
-                0
-            } else {
-                let elapsed_frames = frame.saturating_sub(prev_frame).max(1);
-                total_drawn.saturating_sub(prev_total) / elapsed_frames
-            };
-            PREV_FRAME_DRAWS.store(avg_draws, Ordering::Relaxed);
-        }
-        let prev_frame_draws = PREV_FRAME_DRAWS.load(Ordering::Relaxed);
+        let (prev_frame_draws, _) = note_frame_draws(frame);
         let has_due_textures = first
             && cfg.loading_drain
             && prev_frame_draws < LOADING_DRAIN_MAX_DRAWS
@@ -2143,16 +2205,14 @@ impl State {
         }
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_PASS_MB` overrides it directly; otherwise
-        // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of
-        // thousands of textures (a scene's first minutes) then drains in
-        // fewer frames.
+        // `VICTORY_TEXTURE_STAGE_MB` sets the base budget (capped at
+        // `ACTIVE_3D_PASS_BYTES` / `ACTIVE_3D_PASS_MS` during active 3D
+        // gameplay frames).
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let pass_override = early_pass_config().pass_bytes_override;
-        let per_frame: u64 = pass_override.unwrap_or_else(|| {
-            *PER_FRAME_MB.get_or_init(|| {
-                std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
-            }) << 20
-        });
+        let stage_bytes: u64 = *PER_FRAME_MB.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+        }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -2228,20 +2288,27 @@ impl State {
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
+        let stage_ms = *SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        });
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. Active 3D
+        // gameplay frames (`>= LOADING_DRAIN_MAX_DRAWS` draws) stay capped at
+        // `ACTIVE_3D_PASS_BYTES` / `ACTIVE_3D_PASS_MS` unless `VICTORY_TEXTURE_PASS_MB`
+        // overrides the byte budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 {
-            let bytes = if pass_override.is_some() { per_frame } else { per_frame.saturating_mul(3) };
-            (bytes, span * 3)
-        } else {
-            (per_frame, span)
-        };
+        let (prev_draws, cur_draws) = note_frame_draws(frame);
+        let (heap_ms, per_frame) = compute_heap_pass_budget(HeapPassInput {
+            stage_bytes,
+            stage_ms,
+            pass_bytes_override: pass_override,
+            catchup,
+            due_count: due.len(),
+            frame_draws: prev_draws.max(cur_draws),
+        });
+        let span = std::time::Duration::from_millis(heap_ms);
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2378,17 +2445,17 @@ impl State {
                     );
                 }
             }
-            // Under a budget (early or bake pass): recheck time before the
-            // heavy work of making and staging a texture, and leave a
+            // Recheck time before the heavy work of making and staging a
+            // texture, and under a budget (early or bake pass) leave a
             // margin (up to 64 MiB) so one large upload cannot blow past
             // the watchdog. One giant texture is still allowed when nothing
             // else has been done yet, to avoid starvation of textures that
             // are always large.
             const PER_TEXTURE_BUDGET: u64 = 64 << 20;
+            if began.elapsed() > span {
+                break;
+            }
             if PASS_BUDGET.get().is_some() {
-                if began.elapsed() > span {
-                    break;
-                }
                 let margin = PER_TEXTURE_BUDGET.min(bytes_at_most / 4);
                 if done_bytes > 0
                     && SPENT.load(Ordering::Relaxed).saturating_add(margin)
@@ -4226,13 +4293,21 @@ mod tests {
             Some((EarlyPassKind::Normal, (12, 64 << 20)))
         );
 
-        // No boost once 3D draw counts are at or above the threshold.
+        // No boost once 3D draw counts are at or above the threshold; active 3D
+        // gameplay frames are capped at 32 MiB / 40 ms by default.
         assert_eq!(
             compute_early_pass_budget(
                 cfg,
                 EarlyPassInput { prev_frame_draws: LOADING_DRAIN_MAX_DRAWS, ..input }
             ),
-            Some((EarlyPassKind::Normal, (12, 64 << 20)))
+            Some((EarlyPassKind::Normal, (12, 32 << 20)))
+        );
+        assert_eq!(
+            compute_early_pass_budget(
+                EarlyPassConfig { early_ms: 100, ..cfg },
+                EarlyPassInput { prev_frame_draws: 1400, ..input }
+            ),
+            Some((EarlyPassKind::Normal, (40, 32 << 20)))
         );
 
         // Second+ draw in the same frame gets no early or loading pass.
@@ -4242,6 +4317,47 @@ mod tests {
                 EarlyPassInput { first_in_frame: false, ..input }
             ),
             None
+        );
+    }
+
+    #[test]
+    fn active_3d_heap_textures_caps_to_32mb_and_40ms_unless_overridden() {
+        let base = HeapPassInput {
+            stage_bytes: 192 << 20,
+            stage_ms: 250,
+            pass_bytes_override: None,
+            catchup: true,
+            due_count: 4245,
+            frame_draws: 1400,
+        };
+        // Active 3D frames (>= 150 draws) cap even catchup passes to 32 MiB / 40 ms.
+        assert_eq!(compute_heap_pass_budget(base), (40, 32 << 20));
+        assert_eq!(
+            compute_heap_pass_budget(HeapPassInput { frame_draws: LOADING_DRAIN_MAX_DRAWS, ..base }),
+            (40, 32 << 20)
+        );
+        // Smaller configured stage caps remain respected.
+        assert_eq!(
+            compute_heap_pass_budget(HeapPassInput {
+                stage_bytes: 16 << 20,
+                stage_ms: 20,
+                catchup: false,
+                ..base
+            }),
+            (20, 16 << 20)
+        );
+        // Explicit VICTORY_TEXTURE_PASS_MB bypasses the 32 MiB / 40 ms active-3D cap.
+        assert_eq!(
+            compute_heap_pass_budget(HeapPassInput {
+                pass_bytes_override: Some(128 << 20),
+                ..base
+            }),
+            (750, 128 << 20)
+        );
+        // Low-draw frames (< 150 draws) keep full stage / catchup budgets.
+        assert_eq!(
+            compute_heap_pass_budget(HeapPassInput { frame_draws: 11, ..base }),
+            (750, 576 << 20)
         );
     }
 
@@ -4296,7 +4412,8 @@ mod tests {
             None
         );
 
-        // Time budget stays safely below the Windows 2-second TDR limit.
+        // Time budget stays safely below the Windows 2-second TDR limit on
+        // loading/low-draw frames, and at 40 ms on active 3D frames.
         let high_ms = EarlyPassConfig { early_ms: 5000, ..default_early_cfg() };
         assert_eq!(
             compute_early_pass_budget(high_ms, loading_input),
@@ -4307,7 +4424,7 @@ mod tests {
                 high_ms,
                 EarlyPassInput { prev_frame_draws: 500, ..loading_input }
             ),
-            Some((EarlyPassKind::Normal, (1500, 64 << 20)))
+            Some((EarlyPassKind::Normal, (40, 32 << 20)))
         );
 
         // Bake draws still take precedence over loading/normal passes.
